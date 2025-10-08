@@ -1,50 +1,93 @@
-const http = require('http');
-const net = require('net');
-const url = require('url');
+import http from "http";
+import net from "net";
+import url from "url";
 
 const PORT = process.env.PORT || 8080;
-const AUTH_USER = process.env.AUTH_USER || 'user';
-const AUTH_PASS = process.env.AUTH_PASS || 'pass';
 
-function unauthorized(res) {
-  res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="RailwayProxy"' });
-  res.end('Proxy authentication required');
-}
-function checkAuth(req, res) {
-  if (!AUTH_USER) return true;
-  const h = req.headers['proxy-authorization'] || req.headers['authorization'];
-  if (!h || !h.startsWith('Basic ')) { unauthorized(res); return false; }
-  const [u, p] = Buffer.from(h.slice(6), 'base64').toString().split(':');
-  if (u === AUTH_USER && p === AUTH_PASS) return true;
-  unauthorized(res); return false;
+// базовая авторизация: задаёшь эти переменные в Railway → Variables
+const AUTH_USER = process.env.PROXY_USER || "";
+const AUTH_PASS = process.env.PROXY_PASS || "";
+
+function checkAuth(req) {
+  if (!AUTH_USER && !AUTH_PASS) return true; // без пароля — не советую в проде
+  const hdr = req.headers["proxy-authorization"] || req.headers["authorization"];
+  if (!hdr || !hdr.startsWith("Basic ")) return false;
+  const decoded = Buffer.from(hdr.slice(6), "base64").toString();
+  // формат user:pass
+  return decoded === `${AUTH_USER}:${AUTH_PASS}`;
 }
 
-const server = http.createServer((req, res) => {
-  if (!checkAuth(req, res)) return;
-  const parsed = url.parse(req.url);
+function send407(res) {
+  res.writeHead(407, {
+    "Proxy-Authenticate": "Basic realm=\"railway-proxy\"",
+    "Content-Type": "text/plain; charset=utf-8"
+  });
+  res.end("407 Proxy Authentication Required");
+}
+
+// --- обычные HTTP-запросы через прокси ---
+const server = http.createServer((clientReq, clientRes) => {
+  if (!checkAuth(clientReq)) return send407(clientRes);
+
+  const parsed = url.parse(clientReq.url);
   const options = {
     protocol: parsed.protocol,
     hostname: parsed.hostname,
-    port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-    method: req.method,
+    port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+    method: clientReq.method,
     path: parsed.path,
-    headers: { ...req.headers }
+    headers: clientReq.headers,
+    timeout: 20000
   };
-  delete options.headers['proxy-authorization'];
+
   const proxyReq = http.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
+    clientRes.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    proxyRes.pipe(clientRes);
   });
-  proxyReq.on('error', (err) => { res.writeHead(502); res.end('Error: ' + err); });
-  req.pipe(proxyReq);
+
+  proxyReq.on("timeout", () => {
+    proxyReq.destroy(new Error("upstream timeout"));
+  });
+
+  proxyReq.on("error", (err) => {
+    clientRes.writeHead(502, { "Content-Type": "text/plain" });
+    clientRes.end("Bad Gateway: " + (err?.message || "error"));
+  });
+
+  clientReq.pipe(proxyReq);
 });
 
-server.on('connect', (req, client, head) => {
-  const [host, port] = req.url.split(':');
-  const target = net.connect(port || 443, host, () => {
-    client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-    target.write(head); target.pipe(client); client.pipe(target);
+// --- HTTPS через CONNECT-tуннель ---
+server.on("connect", (req, clientSocket, head) => {
+  if (!checkAuth(req)) {
+    clientSocket.write(
+      "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"railway-proxy\"\r\n\r\n"
+    );
+    clientSocket.destroy();
+    return;
+  }
+
+  // req.url вида "host:port"
+  const [host, portStr] = (req.url || "").split(":");
+  const port = parseInt(portStr || "443", 10) || 443;
+
+  const upstream = net.connect(port, host, () => {
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    if (head && head.length) upstream.write(head);
+    upstream.pipe(clientSocket);
+    clientSocket.pipe(upstream);
   });
+
+  const kill = (err) => {
+    try { clientSocket.destroy(); } catch {}
+    try { upstream.destroy(); } catch {}
+  };
+
+  upstream.setTimeout(20000, () => kill(new Error("upstream timeout")));
+  upstream.on("error", kill);
+  clientSocket.on("error", kill);
 });
 
-server.listen(PORT, () => console.log('Proxy started on port', PORT));
+server.listen(PORT, () => {
+  console.log(`HTTP proxy listening on ${PORT}`);
+});
